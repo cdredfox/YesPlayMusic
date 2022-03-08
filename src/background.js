@@ -8,6 +8,14 @@ import {
   globalShortcut,
   nativeTheme,
 } from 'electron';
+import {
+  isWindows,
+  isMac,
+  isLinux,
+  isDevelopment,
+  isCreateTray,
+  isCreateMpris,
+} from '@/utils/platform';
 import { createProtocol } from 'vue-cli-plugin-electron-builder/lib';
 import { startNeteaseMusicApi } from './electron/services';
 import { initIpcMain } from './electron/ipcMain.js';
@@ -18,23 +26,63 @@ import { createDockMenu } from './electron/dockMenu';
 import { registerGlobalShortcut } from './electron/globalShortcut';
 import { autoUpdater } from 'electron-updater';
 import installExtension, { VUEJS_DEVTOOLS } from 'electron-devtools-installer';
+import { EventEmitter } from 'events';
 import express from 'express';
 import expressProxy from 'express-http-proxy';
 import Store from 'electron-store';
+import { createMpris } from '@/electron/mpris';
 const clc = require('cli-color');
 const log = text => {
   console.log(`${clc.blueBright('[background.js]')} ${text}`);
 };
 
-const isWindows = process.platform === 'win32';
-const isMac = process.platform === 'darwin';
-const isLinux = process.platform === 'linux';
-const isDevelopment = process.env.NODE_ENV === 'development';
+const closeOnLinux = (e, win, store) => {
+  let closeOpt = store.get('settings.closeAppOption');
+  if (closeOpt !== 'exit') {
+    e.preventDefault();
+  }
+
+  if (closeOpt === 'ask') {
+    dialog
+      .showMessageBox({
+        type: 'info',
+        title: 'Information',
+        cancelId: 2,
+        defaultId: 0,
+        message: '确定要关闭吗？',
+        buttons: ['最小化到托盘', '直接退出'],
+        checkboxLabel: '记住我的选择',
+      })
+      .then(result => {
+        if (result.checkboxChecked && result.response !== 2) {
+          win.webContents.send(
+            'rememberCloseAppOption',
+            result.response === 0 ? 'minimizeToTray' : 'exit'
+          );
+        }
+
+        if (result.response === 0) {
+          win.hide(); //调用 最小化实例方法
+        } else if (result.response === 1) {
+          win = null;
+          app.exit(); //exit()直接关闭客户端，不会执行quit();
+        }
+      })
+      .catch(err => {
+        log(err);
+      });
+  } else if (closeOpt === 'exit') {
+    win = null;
+    app.quit();
+  } else {
+    win.hide();
+  }
+};
 
 class Background {
   constructor() {
     this.window = null;
-    this.tray = null;
+    this.ypmTrayImpl = null;
     this.store = new Store({
       windowWidth: {
         width: { type: 'number', default: 1440 },
@@ -43,7 +91,7 @@ class Background {
     });
     this.neteaseMusicAPI = null;
     this.expressApp = null;
-    this.willQuitApp = isMac ? false : true;
+    this.willQuitApp = !isMac;
 
     this.init();
   }
@@ -67,6 +115,14 @@ class Background {
 
     // handle app events
     this.handleAppEvents();
+
+    // disable chromium mpris
+    if (isCreateMpris) {
+      app.commandLine.appendSwitch(
+        'disable-features',
+        'HardwareMediaKeyHandling,MediaSessionService'
+      );
+    }
   }
 
   async initDevtools() {
@@ -124,7 +180,10 @@ class Background {
       minWidth: 1080,
       minHeight: 720,
       titleBarStyle: 'hiddenInset',
-      frame: !isWindows,
+      frame: !(
+        isWindows ||
+        (isLinux && this.store.get('settings.linuxEnableCustomTitlebar'))
+      ),
       title: 'YesPlayMusic',
       show: false,
       webPreferences: {
@@ -207,7 +266,9 @@ class Background {
     this.window.on('close', e => {
       log('window close event');
 
-      if (isMac) {
+      if (isLinux) {
+        closeOnLinux(e, this.window, this.store);
+      } else if (isMac) {
         if (this.willQuitApp) {
           this.window = null;
           app.quit();
@@ -279,8 +340,14 @@ class Background {
       });
       this.handleWindowEvents();
 
+      // create tray
+      if (isCreateTray) {
+        this.trayEventEmitter = new EventEmitter();
+        this.ypmTrayImpl = createTray(this.window, this.trayEventEmitter);
+      }
+
       // init ipcMain
-      initIpcMain(this.window, this.store);
+      initIpcMain(this.window, this.store, this.trayEventEmitter);
 
       // set proxy
       const proxyRules = this.store.get('proxy');
@@ -296,20 +363,22 @@ class Background {
       // create menu
       createMenu(this.window, this.store);
 
-      // create tray
-      if (isWindows || isLinux || isDevelopment) {
-        this.tray = createTray(this.window);
-      }
-
       // create dock menu for macOS
-      app.dock.setMenu(createDockMenu(this.window));
+      const createdDockMenu = createDockMenu(this.window);
+      if (createDockMenu && app.dock) app.dock.setMenu(createdDockMenu);
 
       // create touch bar
-      this.window.setTouchBar(createTouchBar(this.window));
+      const createdTouchBar = createTouchBar(this.window);
+      if (createdTouchBar) this.window.setTouchBar(createdTouchBar);
 
       // register global shortcuts
       if (this.store.get('settings.enableGlobalShortcut') !== false) {
         registerGlobalShortcut(this.window, this.store);
+      }
+
+      // create mpris
+      if (isCreateMpris) {
+        createMpris(this.window);
       }
     });
 
@@ -342,6 +411,18 @@ class Background {
       // unregister all global shortcuts
       globalShortcut.unregisterAll();
     });
+
+    if (!isMac) {
+      app.on('second-instance', (e, cl, wd) => {
+        if (this.window) {
+          this.window.show();
+          if (this.window.isMinimized()) {
+            this.window.restore();
+          }
+          this.window.focus();
+        }
+      });
+    }
   }
 }
 
